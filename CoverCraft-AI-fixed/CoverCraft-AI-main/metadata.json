@@ -1,0 +1,6 @@
+{
+  "name": "CoverCraft AI",
+  "description": "Intelligent AI-powered cover letter generator tailored to your experience and target job description.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
