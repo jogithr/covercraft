@@ -1,6 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
 
-const MODEL_NAME = process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash';
 
 const SYSTEM_PROMPT = `You are an experienced professional cover letter writer helping students and job seekers craft personalized, ready-to-send cover letters.
 
@@ -56,40 +55,62 @@ function getGeminiClient(): GoogleGenAI {
   return new GoogleGenAI({ apiKey });
 }
 
+const PRIMARY_MODEL = process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash';
+const FALLBACK_MODELS = (
+  process.env.GEMINI_FALLBACK_MODELS?.split(',') ?? ['gemini-2.5-flash-lite', 'gemini-2.0-flash']
+)
+  .map((m) => m.trim())
+  .filter(Boolean);
+const MODEL_CHAIN = Array.from(new Set([PRIMARY_MODEL, ...FALLBACK_MODELS]));
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getStatus(error: unknown): number | undefined {
+  const e = error as { status?: number; code?: number; message?: string };
+  if (typeof e?.status === 'number') return e.status;
+  if (typeof e?.code === 'number') return e.code;
+  const m = e?.message?.match(/"code"\s*:\s*(\d{3})/);
+  return m ? Number(m[1]) : undefined;
+}
+
+// Tries each model in order. On overload (503/500/429/timeouts) it retries with
+// backoff + jitter, then falls through to the next model.
 async function generateWithRetry(
   ai: GoogleGenAI,
   contents: string,
-  maxAttempts = 3,
+  attemptsPerModel = 2,
 ): Promise<string> {
   let lastError: unknown;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      const response = await ai.models.generateContent({
-        model: MODEL_NAME,
-        contents,
-        config: {
-          systemInstruction: SYSTEM_PROMPT,
-        },
-      });
+  for (const model of MODEL_CHAIN) {
+    for (let attempt = 1; attempt <= attemptsPerModel; attempt += 1) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents,
+          config: { systemInstruction: SYSTEM_PROMPT },
+        });
 
-      const text = cleanLetterOutput(response.text ?? '');
-      if (!text) {
-        throw new Error('Gemini returned an empty cover letter.');
+        const text = cleanLetterOutput(response.text ?? '');
+        if (!text) {
+          throw new Error('Gemini returned an empty cover letter.');
+        }
+        return text;
+      } catch (error: unknown) {
+        lastError = error;
+        const status = getStatus(error);
+        if (status === 400 || status === 401 || status === 403) throw error;
+
+        const isTemporary =
+          status === undefined || status === 404 || status === 408 || status === 429 || status >= 500;
+        if (!isTemporary) throw error;
+
+        if (attempt < attemptsPerModel) {
+          await sleep(600 * 2 ** (attempt - 1) + Math.random() * 300);
+        }
       }
-      return text;
-    } catch (error: unknown) {
-      lastError = error;
-      const errObj = error as { status?: number; code?: number };
-      const status = errObj?.status ?? errObj?.code;
-      const isRetryable = status === undefined || status >= 500 || status === 408;
-
-      if (!isRetryable || attempt === maxAttempts) {
-        throw error;
-      }
-
-      const delayMs = 400 * 2 ** (attempt - 1);
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
 
@@ -115,6 +136,14 @@ function formatApiError(error: unknown): { status: number; message: string } {
       status: 429,
       message:
         'Gemini API rate limit or quota was reached. Please wait a moment and try again.',
+    };
+  }
+
+  if (status === 503 || /UNAVAILABLE|high demand/i.test(rawMessage)) {
+    return {
+      status: 503,
+      message:
+        'The AI service is very busy right now. We tried several models, but none were available. Please wait a few seconds and press Try Again.',
     };
   }
 
